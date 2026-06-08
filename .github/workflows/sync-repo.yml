@@ -1,0 +1,117 @@
+name: 同步源码
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: '源仓库地址'
+        required: true
+        default: 'https://github.com/TonyJiangWJ/mimotion.git'
+        type: string
+      source_branch:
+        description: '源仓库分支'
+        required: false
+        default: 'master'
+        type: string
+      target_branch:
+        description: '当前仓库目标分支'
+        required: false
+        default: 'master'
+        type: string
+      commit_message:
+        description: '提交信息'
+        required: false
+        default: '同步源码 (keep encrypted_tokens.data & sync-repo.yml)'
+        type: string
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      # v4版本中workflows权限需通过actions权限替代
+      actions: write
+
+    steps:
+      - name: Checkout current repository
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.target_branch }}
+          token: ${{ secrets.PAT }}  # 使用已保存的PAT令牌
+          fetch-depth: 0
+
+      - name: Configure Git user
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Backup protected files
+        run: |
+          # 备份需要保护的文件列表
+          PROTECTED_FILES=("encrypted_tokens.data" ".github/workflows/sync-repo.yml")
+          for file in "${PROTECTED_FILES[@]}"; do
+            if [ -f "$file" ]; then
+              cp "$file" "/tmp/$(basename "$file").bak"
+              echo "✅ Backed up $file"
+            else
+              echo "⚠️ $file not found in current repo"
+            fi
+          done
+
+      - name: Add remote and fetch
+        run: |
+          git remote add source ${{ inputs.source_repo }}
+          git fetch source ${{ inputs.source_branch }}
+
+      - name: Merge or Reset to Source
+        run: |
+          echo "Attempting to merge source branch..."
+          if git merge source/${{ inputs.source_branch }} --allow-unrelated-histories -X theirs -m "${{ inputs.commit_message }}"; then
+            echo "✅ Merge successful."
+          else
+            echo "⚠️ Merge failed or conflicts occurred. Falling back to hard reset..."
+            git reset --hard source/${{ inputs.source_branch }}
+            echo "✅ Hard reset to source branch completed."
+          fi
+
+      - name: Restore protected files
+        run: |
+          # 恢复所有受保护的文件
+          PROTECTED_FILES=("encrypted_tokens.data" ".github/workflows/sync-repo.yml")
+          for file in "${PROTECTED_FILES[@]}"; do
+            backup_file="/tmp/$(basename "$file").bak"
+            if [ -f "$backup_file" ]; then
+              # 确保目标目录存在
+              mkdir -p "$(dirname "$file")"
+              cp "$backup_file" "$file"
+              echo "✅ Restored $file from backup."
+              
+              # 如果文件被git追踪，则添加到暂存区
+              if git ls-files --error-unmatch "$file" > /dev/null 2>&1; then
+                git add "$file"
+                echo "  File staged for commit."
+              fi
+            else
+              echo "ℹ️ No backup found for $file, skipping restore."
+            fi
+          done
+
+      - name: Commit and Push
+        run: |
+          # 检查是否有变更需要提交
+          if ! git diff --staged --quiet || ! git diff HEAD --quiet; then
+            git add .
+            git commit -m "${{ inputs.commit_message }}" --allow-empty
+            
+            echo "Pushing changes to ${{ inputs.target_branch }}..."
+            git push origin HEAD:${{ inputs.target_branch }} --force
+            echo "✅ Sync completed successfully!"
+          else
+            echo "No changes to push."
+          fi
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -f /tmp/*.bak
+          git remote remove source || true
